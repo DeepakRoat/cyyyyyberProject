@@ -41,5 +41,3 @@ ENV/
 *evaluation_stats.txt
 *evaluation_score*.txt
 aasist/
-test/
-train/
