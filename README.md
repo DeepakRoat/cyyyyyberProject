@@ -7,3 +7,5 @@ to train model : python train.py
 to test model : python eval.py
 
 to run test single audio file : python main.py <audio_file>
+
+in test/train folder keep : .flac audio files for test/train
