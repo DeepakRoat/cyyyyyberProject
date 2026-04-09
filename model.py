@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from util import compute_eer
 
-
+"""
 class AttentiveStatsPool(nn.Module):
     def __init__(self, in_channels, attention_channels=128):
         super(AttentiveStatsPool, self).__init__()
@@ -63,9 +63,10 @@ class myTCN(nn.Module):
         X = self.out(X)                        # [B, 1]
 
         return X
+"""
 
 class AttentiveStatsPoolSmall(nn.Module):
-    def __init__(self, in_channels=768, attention_channels=64, output_dim=128):
+    def __init__(self, in_channels=768, attention_channels=128, output_dim=256):
         super().__init__()
 
         self.attention = nn.Sequential(
@@ -91,7 +92,7 @@ class AttentiveStatsPoolSmall(nn.Module):
         pooled = torch.cat([mean, std], dim=1)  # [B, 1536]
 
         pooled = self.proj(pooled)   # [B, 128]
-        pooled = self.act(pooled)    # 🔥 activation here
+        #pooled = self.act(pooled)    # 🔥 activation here
 
         return pooled
 
@@ -99,15 +100,17 @@ class AttentiveStatsPoolSmall(nn.Module):
 class SmallModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.pool = AttentiveStatsPoolSmall(768, 64, 128)
-        self.out = nn.Linear(128, 1)
+        self.pool = AttentiveStatsPoolSmall(768, 384, 768)
+        self.l1 = nn.Linear(768, 32)
+        self.out = nn.Linear(32, 1)
 
     def forward(self, x):
         x = self.pool(x)
+        x = F.gelu((self.l1(x)))
         x = self.out(x)   # no activation (BCEWithLogitsLoss expects raw logits)
         return x
 
-def train_model(model:myTCN, train_loader, val_loader, epochs=10, device="cuda"):
+def train_model(model:SmallModel, train_loader, val_loader, epochs=10, device="cuda"):
     model.to(device)
     """
     for params in model.parameters():
@@ -118,11 +121,12 @@ def train_model(model:myTCN, train_loader, val_loader, epochs=10, device="cuda")
             param.requires_grad = True
     """
     criterion = nn.BCEWithLogitsLoss()
+    smoothing = 0.15
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=4e-5,
-        weight_decay=1e-3
+        lr=9e-5,
+        weight_decay=4e-4
     )
 
     for epoch in range(epochs):
@@ -153,8 +157,10 @@ def train_model(model:myTCN, train_loader, val_loader, epochs=10, device="cuda")
             pos_weight = torch.tensor([2.5], device=device)
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-            # training
-            loss = criterion(logits, y)
+            smoothed_y = torch.where(y == 1.0, 1.0 - smoothing, smoothing)
+
+            # 3. Calculate loss using the smoothed labels and training criterion
+            loss = criterion(logits, smoothed_y)
 
             loss.backward()
             optimizer.step()

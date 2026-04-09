@@ -7,7 +7,7 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import WavLMModel
 
-from model import myTCN, SmallModel
+from model import SmallModel
 
 # =========================
 # CONFIG

@@ -4,7 +4,7 @@ import h5py
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from model import myTCN, train_model, SmallModel
+from model import train_model, SmallModel
 
 
 def load_labels(protocol_file):
@@ -148,7 +148,7 @@ def main():
     # =========================
     # HYPERPARAMS
     # =========================
-    BATCH_SIZE = 128    #128
+    BATCH_SIZE = 96    #128
     EPOCHS = 2
     NUM_WORKERS = 6
     SEED = 42
