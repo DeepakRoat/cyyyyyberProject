@@ -1,0 +1,47 @@
+# ---------------------------------------------------
+# Standard Python Ignores
+# ---------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments (just in case you add one later)
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ---------------------------------------------------
+# IDEs and Editors
+# ---------------------------------------------------
+.vscode/
+
+# ---------------------------------------------------
+# Project Specific: Deep Learning & Models
+# ---------------------------------------------------
+# Ignore saved model weights
+
+
+# Ignore large downloaded base models
+wavlm-base/
+
+# Ignore PyTorch tensor data files (implied by flac_to_pt.py)
+*.pt
+
+# ---------------------------------------------------
+# Project Specific: Datasets & Audio
+# ---------------------------------------------------
+# Ignore audio files to prevent uploading large datasets
+*.flac
+*.wav
+
+# ---------------------------------------------------
+# Project Specific: Logs and Outputs
+# ---------------------------------------------------
+# Ignore all the generated evaluation statistics and scores
+*evaluation_stats.txt
+*evaluation_score*.txt
+aasist/
+test/
+train/
