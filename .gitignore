@@ -23,8 +23,6 @@ ENV/
 # Ignore saved model weights
 
 
-# Ignore large downloaded base models
-wavlm-base/
 
 # Ignore PyTorch tensor data files (implied by flac_to_pt.py)
 *.pt
