@@ -1,18 +1,22 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import WavLMModel
+from transformers import WavLMModel, WavLMConfig
 import os
 from tqdm import tqdm
 import torchaudio
 import torch.nn.functional as F
 import h5py
 import numpy as np
+import threading
+import queue
 
 # --- 1. SETUP ---
 local_model_path = "./wavlm-base"
 
+config = WavLMConfig.from_pretrained(local_model_path)
+config.num_hidden_layers = 4
 # We only need the model now; we built a faster GPU native processor!
-model = WavLMModel.from_pretrained(local_model_path)
+model = WavLMModel.from_pretrained(local_model_path, config=config)
 
 for param in model.parameters():
     param.requires_grad = False
@@ -23,7 +27,7 @@ model.eval()
 print("WavLM model loaded successfully and frozen!")
 
 AUDIO_DIR  = "./train"
-SAVE_DIR = "D:/embeddings_train"
+SAVE_DIR = "D:/emb_train"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 TARGET_SR = 16000
@@ -143,6 +147,41 @@ class AudioChunkDataset(Dataset):
         chunks_tensor = torch.stack(chunks)
         return file, chunks_tensor
 
+# --- THE ASYNCHRONOUS WRITER THREAD ---
+def hdf5_writer_worker(q, save_dir):
+    """
+    This runs in the background. It waits for the GPU to throw embeddings 
+    into the queue, then compresses and saves them while the GPU keeps working.
+    """
+    H5_BATCH_LIMIT = 1500
+    file_counter = 0
+    h5_file_idx = len([f for f in os.listdir(save_dir) if f.endswith(".h5")])
+    current_h5_path = os.path.join(save_dir, f"wavlm_features_batch_{h5_file_idx}.h5")
+    
+    h5f = h5py.File(current_h5_path, 'a')
+
+    while True:
+        item = q.get()
+        if item is None:  # "Poison Pill" to kill the thread when we are done
+            break
+            
+        filename, embedding = item
+        
+        # CPU compresses and writes to disk here (GPU is NOT waiting!)
+        h5f.create_dataset(filename, data=embedding, compression="lzf")
+        
+        file_counter += 1
+        if file_counter % H5_BATCH_LIMIT == 0:
+            h5f.close()
+            h5_file_idx += 1
+            current_h5_path = os.path.join(save_dir, f"wavlm_features_batch_{h5_file_idx}.h5")
+            h5f = h5py.File(current_h5_path, 'a')
+            
+        q.task_done()
+
+    h5f.close()
+    print("Writer Thread gracefully shut down.")
+
 # --- 4. MAIN EXECUTION ---
 def main():
     dataset = AudioChunkDataset(AUDIO_DIR, SAVE_DIR)
@@ -151,20 +190,23 @@ def main():
         print("All files are already processed! Exiting.")
         return
 
-    dataloader = DataLoader(dataset, batch_size=1, num_workers=3, shuffle=False, pin_memory=True)
+    # 1. Crank up num_workers so the CPU feeds the GPU fast enough
+    dataloader = DataLoader(dataset, batch_size=1, num_workers=8, shuffle=False, pin_memory=True)
     print(f"Starting extraction for {len(dataset)} files...")
 
-    CHUNK_BATCH_SIZE = 768      #512
+    # 2. Lower chunk batch size to stop GPU cache thrashing
+    CHUNK_BATCH_SIZE = 2048 
     
-    # HDF5 Batching Setup
-    H5_BATCH_LIMIT = 1500
-    file_counter = 0
-    h5_file_idx = len([f for f in os.listdir(SAVE_DIR) if f.endswith(".h5")])
-    current_h5_path = os.path.join(SAVE_DIR, f"wavlm_features_batch_{h5_file_idx}.h5")
+    # 3. SET UP THE ASYNCHRONOUS QUEUE
+    # maxsize=50 means the GPU can get up to 50 files ahead of the Hard Drive
+    write_queue = queue.Queue(maxsize=50) 
     
-    # Open the first HDF5 file
-    h5f = h5py.File(current_h5_path, 'a')
+    # Start the background writer thread
+    writer_thread = threading.Thread(target=hdf5_writer_worker, args=(write_queue, SAVE_DIR))
+    writer_thread.daemon = True
+    writer_thread.start()
 
+    # 4. THE PURE GPU LOOP
     for file_tuple, chunks_tensor in tqdm(dataloader):
         filename = file_tuple[0]
         chunks = chunks_tensor.squeeze(0) 
@@ -174,36 +216,29 @@ def main():
 
         for i in range(0, total_chunks, CHUNK_BATCH_SIZE):
             batch_chunks = chunks[i : i + CHUNK_BATCH_SIZE].to(device)
-            scrambled_chunks = purify_audio_batch_split_scrambler(batch_chunks)
             
-            mean = scrambled_chunks.mean(dim=-1, keepdim=True)
-            var = scrambled_chunks.var(dim=-1, keepdim=True)
-            input_values = (scrambled_chunks - mean) / torch.sqrt(var + 1e-7)
+            # Normalize
+            mean = batch_chunks.mean(dim=-1, keepdim=True)
+            var = batch_chunks.var(dim=-1, keepdim=True)
+            input_values = (batch_chunks - mean) / torch.sqrt(var + 1e-7)
 
+            # GPU Math
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    outputs = model(input_values)  
+                    outputs = model(input_values)
                     emb = outputs.last_hidden_state
                     
-                # Keep it in FP16 before moving to CPU to save RAM
-                chunk_embeddings.append(emb.cpu().to(torch.float16))
-
-        # Combine chunks and convert to a pure FP16 NumPy array for HDF5
+            chunk_embeddings.append(emb.cpu().to(torch.float16))
+            
         final_file_embedding = torch.cat(chunk_embeddings, dim=0).numpy()
         
-        # Save directly into the HDF5 database with compression
-        h5f.create_dataset(filename, data=final_file_embedding, compression="gzip", compression_opts=4)
+        # 🔥 THE MAGIC: Throw it in the queue and immediately move to the next file!
+        write_queue.put((filename, final_file_embedding))
 
-        # Batch Management: Close file and open a new one every 1000 files
-        file_counter += 1
-        if file_counter % H5_BATCH_LIMIT == 0:
-            h5f.close()
-            h5_file_idx += 1
-            current_h5_path = os.path.join(SAVE_DIR, f"wavlm_features_batch_{h5_file_idx}.h5")
-            h5f = h5py.File(current_h5_path, 'a')
-
-    # Close the final file when the loop finishes
-    h5f.close()
+    # 5. CLEAN UP
+    print("GPU finished all math! Waiting for Hard Drive to finish saving...")
+    write_queue.put(None)   # Send the poison pill
+    writer_thread.join()    # Wait for the background thread to finish writing
     print("All chunked embeddings saved successfully to HDF5 databases!")
 
 if __name__ == '__main__':

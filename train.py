@@ -4,7 +4,7 @@ import h5py
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from model import train_model, SmallModel
+from model import train_model, myTCN
 
 
 def load_labels(protocol_file):
@@ -150,7 +150,7 @@ def main():
     # =========================
     BATCH_SIZE = 96    #128
     EPOCHS = 2
-    NUM_WORKERS = 6
+    NUM_WORKERS = 5
     SEED = 42
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -274,7 +274,7 @@ def main():
     # =========================
     # MODEL + TRAIN
     # =========================
-    model = SmallModel() #myTCN()
+    model = myTCN()
 
     if use_previousWeights and os.path.exists(MODEL_PATH):
         print(f"Loading previous weights from {MODEL_PATH}")
