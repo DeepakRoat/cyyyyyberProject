@@ -5,6 +5,7 @@ import tempfile
 import torch
 import torchaudio
 import torch.nn.functional as F
+import json
 from transformers import WavLMModel
 
 from model import SmallModel
@@ -175,11 +176,15 @@ def chunk_audio(audio):
 # MODEL LOADING
 # =========================
 def load_wavlm():
+    """Load WavLM exactly like flac_to_pt.py does"""
     wavlm = WavLMModel.from_pretrained(WAVLM_PATH)
+    
     for param in wavlm.parameters():
         param.requires_grad = False
+    
     wavlm.to(device)
     wavlm.eval()
+    
     return wavlm
 
 
@@ -206,8 +211,8 @@ def extract_full_embeddings(wavlm, chunks):
     for i in range(0, total_chunks, CHUNK_BATCH_SIZE):
         batch = chunks[i:i + CHUNK_BATCH_SIZE].to(device)
 
-        # 🔥 IMPORTANT: remove scrambler for inference
-        input_chunks = batch
+        # Apply scrambler just like flac_to_pt.py does during training
+        input_chunks = purify_audio_batch_split_scrambler(batch)
 
         mean = input_chunks.mean(dim=-1, keepdim=True)
         var = input_chunks.var(dim=-1, keepdim=True)
@@ -259,47 +264,61 @@ def save_embeddings_tmp(embeddings, source_audio_path):
 def predict_from_embeddings(classifier, embeddings):
     with torch.no_grad():
         logits = classifier(embeddings.to(device)).squeeze(1)   # [num_chunks]
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits)  # [num_chunks]
 
-        # same file-level aggregation style as your training validation
-        file_logit = torch.median(logits)
-        file_prob = torch.sigmoid(file_logit).item()
+        # Match eval.py: use MEAN of probabilities (not median of logits)
+        file_prob = probs.mean().item()
 
     pred_label = "spoof" if file_prob > 0.5 else "bonafide"
 
     return {
         "chunk_probs": probs.detach().cpu().tolist(),
-        "file_logit": float(file_logit.detach().cpu().item()),
+        "chunk_logits": logits.detach().cpu().tolist(),
+        "mean_prob": float(file_prob),
         "spoof_probability": float(file_prob),
         "prediction": pred_label
     }
 
 
+
 # =========================
-# MAIN
+# GLOBAL MODELS (Loaded once on startup)
 # =========================
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python main.py <audio_file>")
-        sys.exit(1)
+wavlm = None
+classifier = None
 
-    audio_path = sys.argv[1]
+def initialize_models():
+    """Load both models on GPU once"""
+    global wavlm, classifier
+    
+    if wavlm is None:
+        print(f"Using device: {device}")
+        print("Loading WavLM...")
+        wavlm = load_wavlm()
+        print("✓ WavLM loaded")
+    
+    if classifier is None:
+        print("Loading classifier...")
+        classifier = load_classifier()
+        print("✓ Classifier loaded")
+    
+    return wavlm, classifier
 
-    print(f"Using device: {device}")
 
-    print("Loading WavLM...")
-    wavlm = load_wavlm()
-
-    print("Loading classifier...")
-    classifier = load_classifier()
-
+def process_audio_file(audio_path):
+    """
+    Process audio file and return prediction result.
+    Models must be initialized via initialize_models() first.
+    """
+    if wavlm is None or classifier is None:
+        raise RuntimeError("Models not initialized. Call initialize_models() first.")
+    
     print(f"Reading audio: {audio_path}")
     # convert everything → clean FLAC first
     converted_path = convert_to_flac(audio_path)
     print(f"Converted → {converted_path}")
 
     audio = preprocess_audio(converted_path)
-
     print(f"Duration (sec): {audio.shape[0] / TARGET_SR:.3f}")
 
     chunks = chunk_audio(audio)
@@ -308,25 +327,42 @@ def main():
     print("Extracting full embeddings...")
     embeddings = extract_full_embeddings(wavlm, chunks)
     print(f"Embeddings shape: {tuple(embeddings.shape)}")
-    print("This is [num_chunks, T, 768]")
 
-    tmp_path = save_embeddings_tmp(embeddings, audio_path)
-    print(f"Saved tmp embeddings to: {tmp_path}")
+    result = predict_from_embeddings(classifier, embeddings)
 
-    # optional reload from tmp to verify
-    saved = torch.load(tmp_path, map_location="cpu", weights_only=False)
-    embeddings_reloaded = saved["embeddings"]
-    print(f"Reloaded tmp embeddings shape: {tuple(embeddings_reloaded.shape)}")
+    return {
+        "file": audio_path,
+        "prediction": result['prediction'].upper(),
+        "spoof_probability": result['spoof_probability'],
+        "chunk_count": embeddings.shape[0],
+        "frames_per_chunk": embeddings.shape[1],
+        "embedding_dim": embeddings.shape[2],
+        "chunk_probs": result['chunk_probs'],
+        "chunk_logits": result['chunk_logits'],
+        "mean_prob": result['mean_prob']
+    }
 
-    result = predict_from_embeddings(classifier, embeddings_reloaded)
+
+# =========================
+# MAIN (for CLI usage)
+# =========================
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python main.py <audio_file>")
+        sys.exit(1)
+
+    audio_path = sys.argv[1]
+    
+    initialize_models()
+    result = process_audio_file(audio_path)
 
     print("\n===== RESULT =====")
-    print(f"File: {audio_path}")
-    print(f"Prediction: {result['prediction'].upper()}")
+    print(f"File: {result['file']}")
+    print(f"Prediction: {result['prediction']}")
     print(f"Spoof probability: {result['spoof_probability']:.6f}")
-    print(f"Chunks used: {embeddings_reloaded.shape[0]}")
-    print(f"Frames per chunk (T): {embeddings_reloaded.shape[1]}")
-    print(f"Embedding dim: {embeddings_reloaded.shape[2]}")
+    print(f"Chunks used: {result['chunk_count']}")
+    print(f"Frames per chunk (T): {result['frames_per_chunk']}")
+    print(f"Embedding dim: {result['embedding_dim']}")
 
 
 if __name__ == "__main__":
